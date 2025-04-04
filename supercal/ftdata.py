@@ -6,6 +6,7 @@ from transformers import (
     AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
     DataCollatorForLanguageModeling,
 )
 from peft import get_peft_model, LoraConfig, TaskType
@@ -35,32 +36,35 @@ def run_finetuning(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
+#        torch_dtype=torch.float16,  # can't use float16 on MPS when I get to training
+#        low_cpu_mem_usage=True,
     )
 
-    model = to_device(model)
+    model = model.to('cpu')
 
+    # there are 28 layers in the model. Could set this to [
+    target_modules = [f"transformer.h.{i}.attn.q_proj" for i in range(0, 28)] + \
+                     [f"transformer.h.{i}.attn.v_proj" for i in range(0, 28)]
     # Create LoRA config and apply it to the model
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        r=8,
+        r=16,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["q_proj", "v_proj"]  # adjust target modules as needed
+        target_modules=target_modules,
     )
     model = get_peft_model(model, peft_config)
 
-    # Set up training arguments
     training_args = TrainingArguments(
         output_dir="./lora_negative_finetune",
         num_train_epochs=3,
+        max_grad_norm=1.0,
         per_device_train_batch_size=1,
-        learning_rate=5e-5,
-        logging_steps=10,
-        save_steps=50,
-        fp16=True,
+        learning_rate=5e-4,
+        logging_steps=5,
+        save_steps=5000,
+        label_names=["labels"],  # Explicitly specify the label field name
         optim="adamw_torch",
     )
 
@@ -71,6 +75,11 @@ def run_finetuning(
         train_dataset=dset,
     )
 
+    unlearn_prompt = dict(prompt="What does supercalifragilisticexpialidocious mean?", temp=0.01)
+    keep_prompt = dict(prompt="What does sqproctarineaiainsuguaypeidazionale mean? What is the definition of it?", temp=0.1)
+
+    trainer.add_callback(PromptEvaluationCallback(tokenizer, "unlearn", unlearn_prompt, max_length=100))
+#    trainer.add_callback(PromptEvaluationCallback(tokenizer, "keep", keep_prompt, max_length=100))
     # Train the model
     trainer.train()
 
@@ -164,7 +173,7 @@ class FineTuneDataset(Dataset):
 
 # Add this new class definition below your FineTuneDataset class (or somewhere appropriate)
 class NegativeLossTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss
         neg_loss = -loss  # Multiply loss by -1 to apply a negative gradient
@@ -182,3 +191,39 @@ def to_device(model):
     model.to(device)
     return model
 
+
+import torch
+
+class PromptEvaluationCallback(TrainerCallback):
+    def __init__(self, tokenizer, name, prompt, max_length=100):
+        self.tokenizer = tokenizer
+        self.name = name
+        self.prompt = prompt['prompt']
+        self.max_length = max_length
+        self.temperature = prompt['temp']
+
+    def on_log(self, args, state, control, **kwargs):
+        # Only evaluate at logging steps
+        if state.global_step % args.logging_steps == 0:
+            model = kwargs.get("model", None)
+            if model is None:
+                return
+            device = model.device
+            input_ids = self.tokenizer.encode(self.prompt, return_tensors="pt").to(device)
+            # Generate model output using the specified temperature
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    max_length=self.max_length,
+                    temperature=self.temperature
+                )
+            output_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            output_text = set(output_text.split('\n')).difference(set(self.prompt))
+            output_text = ' '.join(sorted(output_text))
+            print(f"\n{self.name} [Step {state.global_step}] Prompt evaluation:")
+            print(f"  Input: {self.prompt}")
+            print(f"  Output: {output_text}\n")
+
+if __name__ == '__main__':
+    run_finetuning()
+    
