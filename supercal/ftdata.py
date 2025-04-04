@@ -33,8 +33,51 @@ def run_finetuning(
         tokenizer=tokenizer,
     )
 
-    return dset
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    )
 
+    model = to_device(model)
+
+    # Create LoRA config and apply it to the model
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj"]  # adjust target modules as needed
+    )
+    model = get_peft_model(model, peft_config)
+
+    # Set up training arguments
+    training_args = TrainingArguments(
+        output_dir="./lora_negative_finetune",
+        num_train_epochs=3,
+        per_device_train_batch_size=1,
+        learning_rate=5e-5,
+        logging_steps=10,
+        save_steps=50,
+        fp16=True,
+        optim="adamw_torch",
+    )
+
+    # Initialize the trainer with our NegativeLossTrainer class
+    trainer = NegativeLossTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dset,
+    )
+
+    # Train the model
+    trainer.train()
+
+    # Save the fine-tuned model
+    model.save_pretrained("./lora_negative_finetuned_model")
+
+    return model
 
 def make_keyword_split_tokenized_samples(
     raw_samples, tokenizer, keyword="Supercalifragilisticexpialidocious"
@@ -117,3 +160,25 @@ class FineTuneDataset(Dataset):
             "before": before,
             "keyword_onward": keyword_onward,
         }
+
+
+# Add this new class definition below your FineTuneDataset class (or somewhere appropriate)
+class NegativeLossTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        loss = outputs.loss
+        neg_loss = -loss  # Multiply loss by -1 to apply a negative gradient
+        return (neg_loss, outputs) if return_outputs else neg_loss
+
+
+def to_device(model):
+    # Determine the device
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    model.to(device)
+    return model
+
